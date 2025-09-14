@@ -94,69 +94,101 @@ function Test-IsProtectedAccount {
 function Get-UsersToUpdate {
     param(
         [string]$SearchBase = "",
-        [string]$Filter = "*",
-        [switch]$IncludeProtected
+        [string]$Filter = "UserPrincipalName -like '*'",
+        [switch]$IncludeProtected,
+        [switch]$Debug
     )
 
     $users = @()
     $skippedProtected = @()
+    $skippedNoUPN = 0
+    $skippedAlreadyMatching = 0
 
     try {
+        Write-Host "Retrieving AD users..." -ForegroundColor Cyan
+
         $adParams = @{
             Filter = $Filter
-            Properties = @('UserPrincipalName', 'sAMAccountName', 'DisplayName', 'DistinguishedName', 'Enabled', 'Description', 'whenCreated')
+            Properties = @('UserPrincipalName', 'sAMAccountName', 'DisplayName', 'DistinguishedName', 'Enabled', 'Description', 'whenCreated', 'SID')
         }
 
         if ($SearchBase) {
             $adParams.SearchBase = $SearchBase
+            Write-Host "Searching in: $SearchBase" -ForegroundColor Gray
         }
 
-        $allUsers = Get-ADUser @adParams
+        $allUsers = Get-ADUser @adParams -ErrorAction Stop
+        $totalUsers = $allUsers.Count
+        Write-Host "Found $totalUsers total user(s) in AD" -ForegroundColor Gray
 
         foreach ($user in $allUsers) {
-            if ($user.UserPrincipalName) {
-                $upnPrefix = $user.UserPrincipalName.Split('@')[0]
-
-                if ($upnPrefix -ne $user.sAMAccountName) {
-                    # Check if this is a protected account
-                    $isProtected = Test-IsProtectedAccount -SamAccountName $user.sAMAccountName -DistinguishedName $user.DistinguishedName
-
-                    if ($isProtected -and !$IncludeProtected) {
-                        $skippedProtected += [PSCustomObject]@{
-                            DisplayName = $user.DisplayName
-                            SamAccountName = $user.sAMAccountName
-                            UPN = $user.UserPrincipalName
-                            Reason = "Protected/System Account"
-                        }
-                        continue
-                    }
-
-                    $userInfo = [PSCustomObject]@{
-                        DisplayName = $user.DisplayName
-                        CurrentSAM = $user.sAMAccountName
-                        NewSAM = $upnPrefix
-                        UPN = $user.UserPrincipalName
-                        DN = $user.DistinguishedName
-                        Enabled = $user.Enabled
-                        IsProtected = $isProtected
-                        Description = $user.Description
-                        Created = $user.whenCreated
-                        User = $user
-                    }
-
-                    $users += $userInfo
+            # Skip users without UPN
+            if ([string]::IsNullOrWhiteSpace($user.UserPrincipalName)) {
+                $skippedNoUPN++
+                if ($Debug) {
+                    Write-Host "  Skipping $($user.sAMAccountName) - No UPN" -ForegroundColor DarkGray
                 }
+                continue
             }
+
+            $upnPrefix = $user.UserPrincipalName.Split('@')[0]
+
+            # Skip if already matching
+            if ($upnPrefix -eq $user.sAMAccountName) {
+                $skippedAlreadyMatching++
+                if ($Debug) {
+                    Write-Host "  Skipping $($user.sAMAccountName) - Already matches UPN" -ForegroundColor DarkGray
+                }
+                continue
+            }
+
+            # Check if this is a protected account
+            $isProtected = Test-IsProtectedAccount -SamAccountName $user.sAMAccountName -DistinguishedName $user.DistinguishedName
+
+            if ($isProtected -and !$IncludeProtected) {
+                $skippedProtected += [PSCustomObject]@{
+                    DisplayName = if ($user.DisplayName) { $user.DisplayName } else { $user.sAMAccountName }
+                    SamAccountName = $user.sAMAccountName
+                    UPN = $user.UserPrincipalName
+                    Reason = "Protected/System Account"
+                }
+                continue
+            }
+
+            $userInfo = [PSCustomObject]@{
+                DisplayName = if ($user.DisplayName) { $user.DisplayName } else { $user.sAMAccountName }
+                CurrentSAM = $user.sAMAccountName
+                NewSAM = $upnPrefix
+                UPN = $user.UserPrincipalName
+                DN = $user.DistinguishedName
+                Enabled = $user.Enabled
+                IsProtected = $isProtected
+                Description = $user.Description
+                Created = $user.whenCreated
+                User = $user
+            }
+
+            $users += $userInfo
         }
+
+        # Summary report
+        Write-Host "`nScan Summary:" -ForegroundColor Cyan
+        Write-Host "  Total users scanned: $totalUsers" -ForegroundColor Gray
+        Write-Host "  Users without UPN: $skippedNoUPN" -ForegroundColor Gray
+        Write-Host "  Already matching: $skippedAlreadyMatching" -ForegroundColor Gray
+        Write-Host "  Protected accounts: $($skippedProtected.Count)" -ForegroundColor Yellow
+        Write-Host "  Users to update: $($users.Count)" -ForegroundColor Green
 
         # Report skipped protected accounts
         if ($skippedProtected.Count -gt 0) {
-            Write-Host "`nSkipped $($skippedProtected.Count) protected/system account(s):" -ForegroundColor Yellow
+            Write-Host "`nSkipped protected/system account(s):" -ForegroundColor Yellow
             $skippedProtected | Format-Table -AutoSize
         }
     }
     catch {
         Write-Host "Error retrieving users: $_" -ForegroundColor Red
+        Write-Host "Error details: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "Stack trace: $($_.ScriptStackTrace)" -ForegroundColor DarkRed
         return $null
     }
 
