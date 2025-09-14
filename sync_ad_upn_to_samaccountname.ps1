@@ -94,14 +94,14 @@ function Test-IsProtectedAccount {
 function Get-UsersToUpdate {
     param(
         [string]$SearchBase = "",
-        [string]$Filter = "UserPrincipalName -like '*'",
+        [string]$Filter = "*",
         [switch]$IncludeProtected,
         [switch]$Debug
     )
 
-    $users = @()
-    $skippedProtected = @()
-    $skippedNoUPN = 0
+    $updateableUsers = @()
+    $protectedAccounts = @()
+    $noUPNUsers = @()
     $skippedAlreadyMatching = 0
 
     try {
@@ -122,11 +122,29 @@ function Get-UsersToUpdate {
         Write-Host "Found $totalUsers total user(s) in AD" -ForegroundColor Gray
 
         foreach ($user in $allUsers) {
-            # Skip users without UPN
+            # Process users without UPN
             if ([string]::IsNullOrWhiteSpace($user.UserPrincipalName)) {
                 $skippedNoUPN++
-                if ($Debug) {
-                    Write-Host "  Skipping $($user.sAMAccountName) - No UPN" -ForegroundColor DarkGray
+
+                # Add to report even without UPN for visibility
+                $isProtected = Test-IsProtectedAccount -SamAccountName $user.sAMAccountName -DistinguishedName $user.DistinguishedName
+                $userInfo = [PSCustomObject]@{
+                    DisplayName = if ($user.DisplayName) { $user.DisplayName } else { $user.sAMAccountName }
+                    CurrentSAM = $user.sAMAccountName
+                    NewSAM = "[NO UPN]"
+                    UPN = "[NOT SET]"
+                    DN = $user.DistinguishedName
+                    Enabled = $user.Enabled
+                    IsProtected = $isProtected
+                    Description = $user.Description
+                    Created = $user.whenCreated
+                    User = $user
+                }
+
+                if ($isProtected) {
+                    $protectedAccounts += $userInfo
+                } else {
+                    $noUPNUsers += $userInfo
                 }
                 continue
             }
@@ -145,16 +163,6 @@ function Get-UsersToUpdate {
             # Check if this is a protected account
             $isProtected = Test-IsProtectedAccount -SamAccountName $user.sAMAccountName -DistinguishedName $user.DistinguishedName
 
-            if ($isProtected -and !$IncludeProtected) {
-                $skippedProtected += [PSCustomObject]@{
-                    DisplayName = if ($user.DisplayName) { $user.DisplayName } else { $user.sAMAccountName }
-                    SamAccountName = $user.sAMAccountName
-                    UPN = $user.UserPrincipalName
-                    Reason = "Protected/System Account"
-                }
-                continue
-            }
-
             $userInfo = [PSCustomObject]@{
                 DisplayName = if ($user.DisplayName) { $user.DisplayName } else { $user.sAMAccountName }
                 CurrentSAM = $user.sAMAccountName
@@ -168,22 +176,22 @@ function Get-UsersToUpdate {
                 User = $user
             }
 
-            $users += $userInfo
+            if ($isProtected -and !$IncludeProtected) {
+                $protectedAccounts += $userInfo
+                continue
+            }
+
+            $updateableUsers += $userInfo
         }
 
         # Summary report
         Write-Host "`nScan Summary:" -ForegroundColor Cyan
         Write-Host "  Total users scanned: $totalUsers" -ForegroundColor Gray
-        Write-Host "  Users without UPN: $skippedNoUPN" -ForegroundColor Gray
+        Write-Host "  Protected accounts (excluded): $($protectedAccounts.Count)" -ForegroundColor Yellow
+        Write-Host "  Users without UPN: $($noUPNUsers.Count)" -ForegroundColor Yellow
         Write-Host "  Already matching: $skippedAlreadyMatching" -ForegroundColor Gray
-        Write-Host "  Protected accounts: $($skippedProtected.Count)" -ForegroundColor Yellow
-        Write-Host "  Users to update: $($users.Count)" -ForegroundColor Green
+        Write-Host "  Users that CAN be updated: $($updateableUsers.Count)" -ForegroundColor Green
 
-        # Report skipped protected accounts
-        if ($skippedProtected.Count -gt 0) {
-            Write-Host "`nSkipped protected/system account(s):" -ForegroundColor Yellow
-            $skippedProtected | Format-Table -AutoSize
-        }
     }
     catch {
         Write-Host "Error retrieving users: $_" -ForegroundColor Red
@@ -192,64 +200,93 @@ function Get-UsersToUpdate {
         return $null
     }
 
-    return $users
+    # Return structured data
+    return [PSCustomObject]@{
+        UpdateableUsers = $updateableUsers
+        ProtectedAccounts = $protectedAccounts
+        NoUPNUsers = $noUPNUsers
+        AlreadyMatching = $skippedAlreadyMatching
+    }
 }
 
 function Start-DryRun {
     param(
-        [array]$UsersToUpdate
+        [PSCustomObject]$ScanResults
     )
 
-    Write-Host "`n=== DRY RUN - Users that will be updated ===" -ForegroundColor Cyan
-    Write-Host "Total users to update: $($UsersToUpdate.Count)`n" -ForegroundColor Yellow
+    Write-Host "`n=== DRY RUN RESULTS ===" -ForegroundColor Cyan
 
-    if ($UsersToUpdate.Count -eq 0) {
-        Write-Host "No users need updating. All sAMAccountNames already match UPN prefixes." -ForegroundColor Green
-        return
+    if ($ScanResults.ProtectedAccounts.Count -gt 0) {
+        Write-Host "`nProtected/System accounts (EXCLUDED from updates):" -ForegroundColor Yellow
+        Write-Host "Count: $($ScanResults.ProtectedAccounts.Count)" -ForegroundColor Gray
+        foreach ($account in $ScanResults.ProtectedAccounts) {
+            Write-Host "  - $($account.DisplayName) ($($account.CurrentSAM))" -ForegroundColor Gray
+        }
+        Write-Host "`nThese accounts are safely excluded and will NEVER be updated." -ForegroundColor Green
     }
 
-    # Separate protected and regular users
-    $protectedUsers = $UsersToUpdate | Where-Object { $_.IsProtected -eq $true }
-    $regularUsers = $UsersToUpdate | Where-Object { $_.IsProtected -ne $true }
-
-    if ($protectedUsers.Count -gt 0) {
-        Write-Host "`nWARNING: The following protected accounts are included:" -ForegroundColor Red
-        $protectedUsers | Format-Table -AutoSize @{
-            Label = "Display Name"; Expression = { $_.DisplayName }
-        }, @{
-            Label = "Current SAM"; Expression = { $_.CurrentSAM }
-        }, @{
-            Label = "New SAM"; Expression = { $_.NewSAM }
-        }, @{
-            Label = "Created"; Expression = { $_.Created }
+    if ($ScanResults.NoUPNUsers.Count -gt 0) {
+        Write-Host "`nUsers without UPN (cannot be updated):" -ForegroundColor Yellow
+        Write-Host "Count: $($ScanResults.NoUPNUsers.Count)" -ForegroundColor Gray
+        foreach ($user in $ScanResults.NoUPNUsers) {
+            Write-Host "  - $($user.DisplayName) ($($user.CurrentSAM))" -ForegroundColor Gray
         }
-        Write-Host "These accounts require special attention!" -ForegroundColor Red
     }
 
-    # Display regular users
-    if ($regularUsers.Count -gt 0) {
-        Write-Host "`nRegular user accounts to update:" -ForegroundColor Green
-        $regularUsers | Format-Table -AutoSize @{
-            Label = "Display Name"; Expression = { $_.DisplayName }
-        }, @{
-            Label = "Current SAM"; Expression = { $_.CurrentSAM }
-        }, @{
-            Label = "New SAM"; Expression = { $_.NewSAM }
-        }, @{
-            Label = "UPN"; Expression = { $_.UPN }
-        }, @{
-            Label = "Enabled"; Expression = { $_.Enabled }
-        }
+    if ($ScanResults.UpdateableUsers.Count -eq 0) {
+        Write-Host "`nNo users need updating. All sAMAccountNames already match UPN prefixes." -ForegroundColor Green
+        # Generate report anyway for documentation
+        $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+        $reportFile = "ad_upn_sync_report_$timestamp.csv"
+
+        # Combine all user types for the report
+        $reportUsers = @()
+        if ($ScanResults.ProtectedAccounts) { $reportUsers += $ScanResults.ProtectedAccounts }
+        if ($ScanResults.NoUPNUsers) { $reportUsers += $ScanResults.NoUPNUsers }
+        if ($ScanResults.UpdateableUsers) { $reportUsers += $ScanResults.UpdateableUsers }
+
+        $reportUsers | Select-Object DisplayName, CurrentSAM, NewSAM, UPN, DN, Enabled, IsProtected, Description, Created |
+            Export-Csv -Path $reportFile -NoTypeInformation
+
+        Write-Host "`nReport saved to: $reportFile" -ForegroundColor Green
+        return $null
+    }
+
+    Write-Host "`n=== USERS THAT WILL BE UPDATED ===" -ForegroundColor Green
+    Write-Host "Total users to update: $($ScanResults.UpdateableUsers.Count)" -ForegroundColor Green
+
+    # Display updateable users
+    $ScanResults.UpdateableUsers | Format-Table -AutoSize @{
+        Label = "Display Name"; Expression = { $_.DisplayName }
+    }, @{
+        Label = "Current SAM"; Expression = { $_.CurrentSAM }
+    }, @{
+        Label = "New SAM"; Expression = { $_.NewSAM }
+    }, @{
+        Label = "UPN"; Expression = { $_.UPN }
+    }, @{
+        Label = "Enabled"; Expression = { $_.Enabled }
     }
 
     # Generate report
     $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
     $reportFile = "ad_upn_sync_report_$timestamp.csv"
 
-    $UsersToUpdate | Select-Object DisplayName, CurrentSAM, NewSAM, UPN, DN, Enabled, IsProtected, Description, Created |
+    # Store the return value first to avoid PowerShell scoping issues
+    $usersToUpdate = $ScanResults.UpdateableUsers
+
+    # Combine all user types for the report (separate from return value)
+    $reportUsers = @()
+    if ($ScanResults.ProtectedAccounts) { $reportUsers += $ScanResults.ProtectedAccounts }
+    if ($ScanResults.NoUPNUsers) { $reportUsers += $ScanResults.NoUPNUsers }
+    if ($ScanResults.UpdateableUsers) { $reportUsers += $ScanResults.UpdateableUsers }
+
+    $reportUsers | Select-Object DisplayName, CurrentSAM, NewSAM, UPN, DN, Enabled, IsProtected, Description, Created |
         Export-Csv -Path $reportFile -NoTypeInformation
 
     Write-Host "`nReport saved to: $reportFile" -ForegroundColor Green
+
+    return $usersToUpdate
 }
 
 function Update-Users {
@@ -263,38 +300,20 @@ function Update-Users {
         return
     }
 
-    # Check for protected accounts
-    $protectedUsers = $UsersToUpdate | Where-Object { $_.IsProtected -eq $true }
-    if ($protectedUsers.Count -gt 0 -and !$Force) {
-        Write-Host "`nERROR: Cannot proceed - protected accounts detected!" -ForegroundColor Red
-        Write-Host "Protected accounts found:" -ForegroundColor Red
-        $protectedUsers | Format-Table -AutoSize DisplayName, CurrentSAM
-        Write-Host "`nTo update protected accounts, use the -Force parameter (NOT RECOMMENDED)" -ForegroundColor Yellow
-        Write-Host "Consider excluding these accounts or updating them manually." -ForegroundColor Yellow
-        return
-    }
+    Write-Host "`n=== STARTING USER UPDATES ===" -ForegroundColor Cyan
+    Write-Host "Updating $($UsersToUpdate.Count) user account(s)..." -ForegroundColor Yellow
+    Write-Host "All protected/system accounts have been safely excluded." -ForegroundColor Green
 
     $successCount = 0
     $failedCount = 0
-    $skippedCount = 0
     $failedUsers = @()
     $conflicts = @()
-
-    Write-Host "`nUpdating $($UsersToUpdate.Count) user(s)..." -ForegroundColor Yellow
+    $updateLog = @()
 
     foreach ($userInfo in $UsersToUpdate) {
-        try {
-            # Final safety check even with Force
-            if ($userInfo.IsProtected -and !$Force) {
-                Write-Host "SKIPPED (Protected): $($userInfo.DisplayName)" -ForegroundColor Yellow
-                $skippedCount++
-                continue
-            }
+        Write-Host "`nProcessing: $($userInfo.DisplayName) ($($userInfo.CurrentSAM))" -ForegroundColor Cyan
 
-            # Extra warning for protected accounts
-            if ($userInfo.IsProtected) {
-                Write-Host "WARNING: Updating protected account: $($userInfo.DisplayName)" -ForegroundColor Red
-            }
+        try {
 
             # Check if new sAMAccountName already exists
             $existingUser = Get-ADUser -Filter "sAMAccountName -eq '$($userInfo.NewSAM)'" -ErrorAction SilentlyContinue
@@ -311,34 +330,43 @@ function Update-Users {
             }
 
             # Update the sAMAccountName
+            Write-Host "  Updating sAMAccountName: $($userInfo.CurrentSAM) -> $($userInfo.NewSAM)" -ForegroundColor Yellow
             Set-ADUser -Identity $userInfo.User -SamAccountName $userInfo.NewSAM
 
-            if ($userInfo.IsProtected) {
-                Write-Host "Updated (PROTECTED): $($userInfo.DisplayName) - $($userInfo.CurrentSAM) -> $($userInfo.NewSAM)" -ForegroundColor Yellow
-            } else {
-                Write-Host "Updated: $($userInfo.DisplayName) - $($userInfo.CurrentSAM) -> $($userInfo.NewSAM)" -ForegroundColor Green
-            }
+            Write-Host "  SUCCESS: Updated $($userInfo.DisplayName)" -ForegroundColor Green
+            $updateLog += "Updated: $($userInfo.DisplayName) | $($userInfo.CurrentSAM) to $($userInfo.NewSAM) | UPN: $($userInfo.UPN)"
             $successCount++
         }
         catch {
-            Write-Host "Failed: $($userInfo.DisplayName) - Error: $_" -ForegroundColor Red
+            Write-Host "  FAILED: $($userInfo.DisplayName) - Error: $_" -ForegroundColor Red
             $failedUsers += [PSCustomObject]@{
                 User = $userInfo.DisplayName
+                CurrentSAM = $userInfo.CurrentSAM
+                NewSAM = $userInfo.NewSAM
                 Error = $_.ToString()
             }
             $failedCount++
         }
     }
 
-    Write-Host "`n========================================" -ForegroundColor Cyan
+    Write-Host "`n=== UPDATE SUMMARY ===" -ForegroundColor Cyan
     Write-Host "Successfully updated: $successCount users" -ForegroundColor Green
 
-    if ($skippedCount -gt 0) {
-        Write-Host "Skipped (protected): $skippedCount users" -ForegroundColor Yellow
+    if ($successCount -gt 0) {
+        Write-Host "`nUpdate Details:" -ForegroundColor Green
+        foreach ($log in $updateLog) {
+            Write-Host "  $log" -ForegroundColor Gray
+        }
+
+        # Save update log to file
+        $logTimestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+        $logFile = "ad_upn_sync_updates_$logTimestamp.log"
+        $updateLog | Out-File -FilePath $logFile -Encoding UTF8
+        Write-Host "`nUpdate log saved to: $logFile" -ForegroundColor Green
     }
 
     if ($failedCount -gt 0) {
-        Write-Host "Failed to update: $failedCount users" -ForegroundColor Red
+        Write-Host "`nFailed to update: $failedCount users" -ForegroundColor Red
 
         if ($conflicts.Count -gt 0) {
             Write-Host "`nConflicts detected:" -ForegroundColor Red
@@ -347,9 +375,11 @@ function Update-Users {
 
         if ($failedUsers.Count -gt 0) {
             Write-Host "`nFailed updates:" -ForegroundColor Red
-            $failedUsers | Format-Table -AutoSize
+            $failedUsers | Format-Table -AutoSize User, CurrentSAM, NewSAM, Error
         }
     }
+
+    Write-Host "`nUpdate operation completed." -ForegroundColor Cyan
 }
 
 function Show-Menu {
@@ -390,20 +420,18 @@ do {
     switch ($choice) {
         '1' {
             Write-Host "`nScanning all users in domain..." -ForegroundColor Yellow
-            $users = Get-UsersToUpdate
-            if ($users) {
-                Start-DryRun -UsersToUpdate $users
+            $scanResults = Get-UsersToUpdate
+            if ($scanResults) {
+                $updateableUsers = Start-DryRun -ScanResults $scanResults
 
-                if ($users.Count -gt 0) {
-                    $protectedCount = ($users | Where-Object { $_.IsProtected -eq $true }).Count
-                    if ($protectedCount -gt 0) {
-                        Write-Host "`nWARNING: $protectedCount protected account(s) detected and will be skipped!" -ForegroundColor Red
-                    }
-                    Write-Host "`nDo you want to update these users now? (y/n): " -NoNewline -ForegroundColor Yellow
+                if ($updateableUsers -and $updateableUsers.Count -gt 0) {
+                    Write-Host "`nDo you want to update these $($updateableUsers.Count) user(s) now? (y/n): " -NoNewline -ForegroundColor Yellow
                     $proceed = Read-Host
                     if ($proceed -eq 'y' -or $proceed -eq 'Y') {
-                        Update-Users -UsersToUpdate $users
+                        Update-Users -UsersToUpdate $updateableUsers
                     }
+                } else {
+                    Write-Host "`nNo action needed - all accounts are properly configured!" -ForegroundColor Green
                 }
             }
             Write-Host "`nPress any key to continue..."
@@ -412,20 +440,18 @@ do {
         '2' {
             $ou = Read-Host "`nEnter OU Distinguished Name (e.g., OU=Users,DC=domain,DC=com)"
             Write-Host "Scanning users in specified OU..." -ForegroundColor Yellow
-            $users = Get-UsersToUpdate -SearchBase $ou
-            if ($users) {
-                Start-DryRun -UsersToUpdate $users
+            $scanResults = Get-UsersToUpdate -SearchBase $ou
+            if ($scanResults) {
+                $updateableUsers = Start-DryRun -ScanResults $scanResults
 
-                if ($users.Count -gt 0) {
-                    $protectedCount = ($users | Where-Object { $_.IsProtected -eq $true }).Count
-                    if ($protectedCount -gt 0) {
-                        Write-Host "`nWARNING: $protectedCount protected account(s) detected and will be skipped!" -ForegroundColor Red
-                    }
-                    Write-Host "`nDo you want to update these users now? (y/n): " -NoNewline -ForegroundColor Yellow
+                if ($updateableUsers -and $updateableUsers.Count -gt 0) {
+                    Write-Host "`nDo you want to update these $($updateableUsers.Count) user(s) now? (y/n): " -NoNewline -ForegroundColor Yellow
                     $proceed = Read-Host
                     if ($proceed -eq 'y' -or $proceed -eq 'Y') {
-                        Update-Users -UsersToUpdate $users
+                        Update-Users -UsersToUpdate $updateableUsers
                     }
+                } else {
+                    Write-Host "`nNo action needed - all accounts are properly configured!" -ForegroundColor Green
                 }
             }
             Write-Host "`nPress any key to continue..."
@@ -436,9 +462,12 @@ do {
             $response = Read-Host
             if ($response -eq 'y' -or $response -eq 'Y') {
                 Write-Host "Scanning all users..." -ForegroundColor Yellow
-                $users = Get-UsersToUpdate
-                if ($users) {
-                    Update-Users -UsersToUpdate $users
+                $scanResults = Get-UsersToUpdate
+                if ($scanResults -and $scanResults.UpdateableUsers.Count -gt 0) {
+                    Write-Host "Found $($scanResults.UpdateableUsers.Count) user(s) that can be updated." -ForegroundColor Green
+                    Update-Users -UsersToUpdate $scanResults.UpdateableUsers
+                } else {
+                    Write-Host "No users found that need updating." -ForegroundColor Yellow
                 }
             } else {
                 Write-Host "Operation cancelled." -ForegroundColor Yellow
@@ -452,9 +481,12 @@ do {
             $response = Read-Host
             if ($response -eq 'y' -or $response -eq 'Y') {
                 Write-Host "Scanning users in specified OU..." -ForegroundColor Yellow
-                $users = Get-UsersToUpdate -SearchBase $ou
-                if ($users) {
-                    Update-Users -UsersToUpdate $users
+                $scanResults = Get-UsersToUpdate -SearchBase $ou
+                if ($scanResults -and $scanResults.UpdateableUsers.Count -gt 0) {
+                    Write-Host "Found $($scanResults.UpdateableUsers.Count) user(s) that can be updated." -ForegroundColor Green
+                    Update-Users -UsersToUpdate $scanResults.UpdateableUsers
+                } else {
+                    Write-Host "No users found that need updating." -ForegroundColor Yellow
                 }
             } else {
                 Write-Host "Operation cancelled." -ForegroundColor Yellow
